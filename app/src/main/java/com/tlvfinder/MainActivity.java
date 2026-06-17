@@ -79,16 +79,13 @@ public class MainActivity extends AppCompatActivity {
     private void processSharedText(String text) {
         webView.evaluateJavascript(
             "document.getElementById('extracting-banner').style.display='block';" +
-            "document.getElementById('status').textContent='Reading shared post…';", null);
+            "document.getElementById('status').textContent='Reading shared post\u2026';", null);
 
         final String apiKey = BuildConfig.CLAUDE_API_KEY;
         final String inputText = text;
 
         executor.execute(() -> {
-            // Try Claude API first
             String address = extractAddressFromClaude(apiKey, inputText);
-
-            // Fallback: regex extraction
             if (address == null || address.equals("NOT_FOUND") || address.isEmpty()) {
                 address = extractAddressWithRegex(inputText);
             }
@@ -98,7 +95,11 @@ public class MainActivity extends AppCompatActivity {
                 webView.evaluateJavascript(
                     "document.getElementById('extracting-banner').style.display='none';", null);
                 if (finalAddress != null && !finalAddress.isEmpty()) {
-                    String escaped = finalAddress.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", "");
+                    String escaped = finalAddress
+                        .replace("\\", "\\\\")
+                        .replace("'", "\\'")
+                        .replace("\n", " ")
+                        .replace("\r", "");
                     webView.evaluateJavascript(
                         "document.getElementById('search-input').value='" + escaped + "'; doSearch();", null);
                 } else {
@@ -109,61 +110,73 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    // Regex fallback: extract street names from Hebrew or English text
     private String extractAddressWithRegex(String text) {
-        // English: "on X Street", "at X Street", "X Street", "X Ave", "X Blvd", "X Road"
-        Pattern englishStreet = Pattern.compile(
-            "(?:on|at|in)?\\s*([A-Z][a-zA-Z\\s]{2,30}(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr))",
+        // 1. English: "on/at X Street/Ave/Road" (most common in English posts)
+        Pattern p1 = Pattern.compile(
+            "(?:on|at)\\s+([A-Za-z][a-zA-Z'.\\s]{1,25}?\\s+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Drive|Dr))",
             Pattern.CASE_INSENSITIVE);
-        Matcher em = englishStreet.matcher(text);
-        if (em.find()) return em.group(1).trim();
+        Matcher m1 = p1.matcher(text);
+        if (m1.find()) return m1.group(1).trim();
 
-        // Hebrew: רחוב X or just a Hebrew word followed by common street context
-        // Look for "רחוב" (street) followed by Hebrew word
-        Pattern hebrewStreet = Pattern.compile("רחוב\\s+([\\u0590-\\u05FF\\s\\'\"]{2,30})");
-        Matcher hm = hebrewStreet.matcher(text);
-        if (hm.find()) return hm.group(1).trim();
+        // 2. English: "X Street (between Y and Z)"
+        Pattern p2 = Pattern.compile(
+            "([A-Za-z][a-zA-Z'.\\s]{1,25}?)\\s+[Ss]treet\\s*\\(",
+            Pattern.CASE_INSENSITIVE);
+        Matcher m2 = p2.matcher(text);
+        if (m2.find()) return m2.group(1).trim() + " Street";
 
-        // Look for "ברחוב" or "בשדרות" or "בסמטת"
-        Pattern hebrewIn = Pattern.compile("[בב][רשס][חד][ו][ב\\u05D1]\\s+([\\u0590-\\u05FF\\s]{2,30})");
-        Matcher him = hebrewIn.matcher(text);
-        if (him.find()) return him.group(1).trim();
+        // 3. Hebrew: רחוב + street name (stop at dash, comma, newline, or end)
+        Pattern p3 = Pattern.compile(
+            "\u05E8\u05D7\u05D5\u05D1\\s+([\\u0590-\\u05FF\\s'.\"]+?)(?:\\s*[-,\\n]|$)");
+        Matcher m3 = p3.matcher(text);
+        if (m3.find()) return m3.group(1).trim();
 
-        // Hebrew: look for "street, Tel Aviv" pattern — word before "תל אביב"
-        Pattern beforeTLV = Pattern.compile("([\\u0590-\\u05FF]{2,20})(?:\\s*,\\s*תל אביב)");
-        Matcher btm = beforeTLV.matcher(text);
-        if (btm.find()) return btm.group(1).trim();
+        // 4. Hebrew: ברחוב / בשדרות
+        Pattern p4 = Pattern.compile(
+            "[\u05D1][\u05E8\u05E9][\u05D7\u05D3][\u05D5][\u05D1\\u05D1]\\s+([\\u0590-\\u05FF\\s'.]+?)(?:\\s*[-,\\n]|$)");
+        Matcher m4 = p4.matcher(text);
+        if (m4.find()) return m4.group(1).trim();
 
-        // English: "X Street (between..." — common in rental posts
-        Pattern betweenPattern = Pattern.compile("([A-Z][a-zA-Z\\s]{2,20})\\s*(?:Street)?\\s*\\(between");
-        Matcher bpm = betweenPattern.matcher(text);
-        if (bpm.find()) return bpm.group(1).trim() + " Street";
+        // 5. Hebrew: word before ,תל אביב
+        Pattern p5 = Pattern.compile(
+            "([\\u0590-\\u05FF'.]{2,20})(?:\\s*,\\s*\u05EA\u05DC[ -]?\u05D0\u05D1\u05D9\u05D1)");
+        Matcher m5 = p5.matcher(text);
+        if (m5.find()) return m5.group(1).trim();
 
         return null;
     }
 
     private String extractAddressFromClaude(String apiKey, String text) {
         try {
-            if (apiKey == null || apiKey.isEmpty() || apiKey.equals("null")) return null;
+            if (apiKey == null || apiKey.isEmpty() || apiKey.equals("null") || apiKey.equals("\"\"")) return null;
 
             URL url = new URL("https://api.anthropic.com/v1/messages");
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
             conn.setRequestProperty("x-api-key", apiKey);
             conn.setRequestProperty("anthropic-version", "2023-06-01");
             conn.setDoOutput(true);
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(15000);
 
-            String safeText = text.replace("\\", "\\\\").replace("\"", "\\\"")
-                .replace("\n", "\\n").replace("\r", "").replace("\t", " ");
-            if (safeText.length() > 1000) safeText = safeText.substring(0, 1000);
+            String safeText = text
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "")
+                .replace("\t", " ");
+            if (safeText.length() > 800) safeText = safeText.substring(0, 800);
 
-            String body = "{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":50,\"messages\":[{\"role\":\"user\",\"content\":\"Extract only the street name or address from this apartment listing text. Reply with just the street name, nothing else. If no address found reply NOT_FOUND.\\n\\nText: " + safeText + "\"}]}";
+            String body = "{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":50,"
+                + "\"messages\":[{\"role\":\"user\",\"content\":"
+                + "\"Extract only the street name from this apartment listing. Reply with just the street name only, nothing else. If none found reply NOT_FOUND.\\n\\n"
+                + safeText + "\"}]}";
 
+            byte[] bodyBytes = body.getBytes("UTF-8");
+            conn.setRequestProperty("Content-Length", String.valueOf(bodyBytes.length));
             OutputStream os = conn.getOutputStream();
-            os.write(body.getBytes("UTF-8"));
+            os.write(bodyBytes);
             os.close();
 
             int code = conn.getResponseCode();
