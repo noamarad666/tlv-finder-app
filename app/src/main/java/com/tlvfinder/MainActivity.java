@@ -1,5 +1,8 @@
 package com.tlvfinder;
 
+import android.content.ClipboardManager;
+import android.content.ClipData;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
@@ -10,23 +13,13 @@ import android.webkit.WebViewClient;
 import android.webkit.WebChromeClient;
 import androidx.appcompat.app.AppCompatActivity;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class MainActivity extends AppCompatActivity {
     private WebView webView;
     private boolean pageReady = false;
-    private String pendingSharedText = null;
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private String pendingText = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -44,120 +37,83 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 pageReady = true;
-                if (pendingSharedText != null) {
-                    processSharedText(pendingSharedText);
-                    pendingSharedText = null;
+                if (pendingText != null) {
+                    processText(pendingText);
+                    pendingText = null;
                 }
             }
         });
 
         webView.loadUrl("file:///android_asset/index.html");
-        handleIntent(getIntent());
+
+        // Check for shared intent first, then clipboard
+        String sharedText = getSharedText(getIntent());
+        if (sharedText != null && !sharedText.isEmpty()) {
+            pendingText = sharedText;
+        } else {
+            String clipboard = getClipboardText();
+            if (clipboard != null && !clipboard.isEmpty() && !clipboard.startsWith("http")) {
+                pendingText = clipboard;
+            }
+        }
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        handleIntent(intent);
+        String sharedText = getSharedText(intent);
+        if (sharedText != null && !sharedText.isEmpty()) {
+            if (pageReady) processText(sharedText);
+            else pendingText = sharedText;
+        }
     }
 
-    private void handleIntent(Intent intent) {
-        if (intent == null) return;
-        if (!Intent.ACTION_SEND.equals(intent.getAction())) return;
-        String type = intent.getType();
-        if (type == null || !type.startsWith("text/")) return;
-        String sharedText = intent.getStringExtra(Intent.EXTRA_TEXT);
-        if (sharedText == null || sharedText.isEmpty()) return;
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Each time app comes to foreground, check clipboard
         if (pageReady) {
-            processSharedText(sharedText);
-        } else {
-            pendingSharedText = sharedText;
-        }
-    }
-
-    private void processSharedText(final String text) {
-        setStatus("Reading post\u2026");
-
-        // If it's a URL, fetch the page and extract text from it
-        if (text.trim().startsWith("http")) {
-            executor.execute(() -> {
-                String pageText = fetchPageText(text.trim());
-                final String extracted = pageText != null ? extractAddress(pageText) : null;
-                mainHandler.post(() -> {
-                    if (extracted != null && !extracted.isEmpty()) {
-                        searchAddress(extracted);
-                    } else {
-                        setStatus("Could not extract address from post. Try searching manually.");
-                    }
-                });
-            });
-        } else {
-            // Direct text — extract immediately
-            String address = extractAddress(text);
-            if (address != null && !address.isEmpty()) {
-                searchAddress(address);
-            } else {
-                setStatus("No address found. Try searching manually.");
+            String clipboard = getClipboardText();
+            if (clipboard != null && !clipboard.isEmpty() && !clipboard.startsWith("http")) {
+                processText(clipboard);
             }
         }
     }
 
-    private String fetchPageText(String urlStr) {
+    private String getSharedText(Intent intent) {
+        if (intent == null) return null;
+        if (!Intent.ACTION_SEND.equals(intent.getAction())) return null;
+        String type = intent.getType();
+        if (type == null || !type.startsWith("text/")) return null;
+        return intent.getStringExtra(Intent.EXTRA_TEXT);
+    }
+
+    private String getClipboardText() {
         try {
-            // Facebook share URLs redirect — follow redirects and get og:description / page text
-            URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("GET");
-            conn.setInstanceFollowRedirects(true);
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(15000);
-            // Pretend to be a browser so Facebook returns HTML
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
-            conn.setRequestProperty("Accept-Language", "he,en;q=0.9");
-
-            int code = conn.getResponseCode();
-            if (code != 200) return null;
-
-            BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            int maxLines = 300;
-            while ((line = br.readLine()) != null && maxLines-- > 0) {
-                sb.append(line).append("\n");
-            }
-            br.close();
-
-            String html = sb.toString();
-
-            // Try og:description first (most reliable)
-            Pattern ogDesc = Pattern.compile("og:description\"[^>]*content=\"([^\"]{10,500})\"", Pattern.CASE_INSENSITIVE);
-            Matcher m = ogDesc.matcher(html);
-            if (m.find()) return m.group(1);
-
-            // Try meta description
-            Pattern metaDesc = Pattern.compile("<meta[^>]*name=\"description\"[^>]*content=\"([^\"]{10,500})\"", Pattern.CASE_INSENSITIVE);
-            Matcher m2 = metaDesc.matcher(html);
-            if (m2.find()) return m2.group(1);
-
-            // Return raw HTML for keyword scanning as last resort
-            return html.length() > 3000 ? html.substring(0, 3000) : html;
-
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return null;
+            ClipData.Item item = cm.getPrimaryClip().getItemAt(0);
+            if (item == null) return null;
+            CharSequence text = item.getText();
+            return text != null ? text.toString() : null;
         } catch (Exception e) {
             return null;
         }
     }
 
-    private void searchAddress(String address) {
-        String escaped = address.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", "");
-        webView.evaluateJavascript(
-            "document.getElementById('search-input').value='" + escaped + "'; doSearch();", null);
-    }
-
-    private void setStatus(String msg) {
-        String escaped = msg.replace("'", "\\'");
-        webView.evaluateJavascript(
-            "document.getElementById('status').textContent='" + escaped + "';", null);
+    private void processText(String text) {
+        String address = extractAddress(text);
+        if (address != null && !address.isEmpty()) {
+            String escaped = address.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", "");
+            webView.evaluateJavascript(
+                "document.getElementById('search-input').value='" + escaped + "'; doSearch();", null);
+        } else {
+            String preview = text.length() > 60 ? text.substring(0, 60) : text;
+            String escapedPreview = preview.replace("\\", "").replace("'", "").replace("\n", " ").replace("\"", "");
+            webView.evaluateJavascript(
+                "document.getElementById('status').textContent='No address found in: " + escapedPreview + "';", null);
+        }
     }
 
     private String extractAddress(String text) {
