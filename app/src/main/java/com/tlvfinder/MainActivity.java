@@ -5,8 +5,6 @@ import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -38,55 +36,23 @@ public class MainActivity extends AppCompatActivity {
             public void onPageFinished(WebView view, String url) {
                 pageReady = true;
                 if (pendingText != null) {
-                    processText(pendingText);
+                    handleText(pendingText);
                     pendingText = null;
                 }
             }
         });
 
         webView.loadUrl("file:///android_asset/index.html");
-
-        // Check for shared intent first, then clipboard
-        String sharedText = getSharedText(getIntent());
-        if (sharedText != null && !sharedText.isEmpty()) {
-            pendingText = sharedText;
-        } else {
-            String clipboard = getClipboardText();
-            if (clipboard != null && !clipboard.isEmpty() && !clipboard.startsWith("http")) {
-                pendingText = clipboard;
-            }
-        }
-    }
-
-    @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        String sharedText = getSharedText(intent);
-        if (sharedText != null && !sharedText.isEmpty()) {
-            if (pageReady) processText(sharedText);
-            else pendingText = sharedText;
-        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        // Each time app comes to foreground, check clipboard
-        if (pageReady) {
-            String clipboard = getClipboardText();
-            if (clipboard != null && !clipboard.isEmpty() && !clipboard.startsWith("http")) {
-                processText(clipboard);
-            }
+        String clipboard = getClipboardText();
+        if (clipboard != null && !clipboard.isEmpty() && !clipboard.startsWith("http")) {
+            if (pageReady) handleText(clipboard);
+            else pendingText = clipboard;
         }
-    }
-
-    private String getSharedText(Intent intent) {
-        if (intent == null) return null;
-        if (!Intent.ACTION_SEND.equals(intent.getAction())) return null;
-        String type = intent.getType();
-        if (type == null || !type.startsWith("text/")) return null;
-        return intent.getStringExtra(Intent.EXTRA_TEXT);
     }
 
     private String getClipboardText() {
@@ -102,30 +68,19 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void processText(String text) {
+    private void handleText(String text) {
         String address = extractAddress(text);
         if (address != null && !address.isEmpty()) {
+            // Put ONLY the extracted address in the search box
             String escaped = address.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", "");
             webView.evaluateJavascript(
                 "document.getElementById('search-input').value='" + escaped + "'; doSearch();", null);
-        } else {
-            String preview = text.length() > 60 ? text.substring(0, 60) : text;
-            String escapedPreview = preview.replace("\\", "").replace("'", "").replace("\n", " ").replace("\"", "");
-            webView.evaluateJavascript(
-                "document.getElementById('status').textContent='No address found in: " + escapedPreview + "';", null);
         }
+        // If no address found, do nothing — don't put garbage in the search box
     }
 
     private String extractAddress(String text) {
-        String[] keywords = {
-            "רחוב ",
-            "רח' ",
-            "שדרות ",
-            "סמטת ",
-            " on ",
-            " at ",
-            " in "
-        };
+        String[] keywords = { "רחוב ", "רח' ", "שדרות ", "סמטת ", " on ", " at " };
         List<String> cityWords = Arrays.asList("תל", "אביב", "tel", "aviv", "israel", "ישראל");
 
         for (String kw : keywords) {
