@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tel Aviv Area Finder</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f3; height: 100dvh; display: flex; flex-direction: column; }
+    #toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: white; border-bottom: 1px solid #e0ddd6; flex-wrap: wrap; }
+    #toolbar h1 { font-size: 15px; font-weight: 600; flex: 1; color: #1a1a1a; min-width: 140px; }
+    .tool-btn { font-size: 13px; padding: 6px 13px; border-radius: 8px; border: 1px solid #d0cec6; background: white; color: #1a1a1a; cursor: pointer; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .tool-btn:hover { background: #f0ede8; }
+    .tool-btn.active { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
+    .tool-btn.danger { color: #b91c1c; border-color: #fca5a5; }
+    .tool-btn.danger:hover { background: #fef2f2; }
+    #search-bar { display: flex; gap: 8px; padding: 10px 14px; background: #faf9f7; border-bottom: 1px solid #e0ddd6; }
+    #search-input { flex: 1; font-size: 14px; padding: 8px 12px; border-radius: 8px; border: 1px solid #d0cec6; background: white; color: #1a1a1a; outline: none; }
+    #search-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px #dbeafe; }
+    #search-btn { font-size: 13px; padding: 8px 18px; border-radius: 8px; border: none; background: #3b82f6; color: white; cursor: pointer; font-weight: 500; }
+    #search-btn:hover { background: #2563eb; }
+    #extracting-banner { display: none; padding: 8px 14px; background: #fffbeb; color: #92400e; font-size: 13px; border-bottom: 1px solid #fde68a; }
+    #map { flex: 1; }
+    #status { font-size: 12px; color: #888; padding: 5px 14px; background: #faf9f7; border-top: 1px solid #e0ddd6; min-height: 26px; }
+  </style>
+</head>
+<body>
+<div id="toolbar">
+  <h1>📍 Tel Aviv Area Finder</h1>
+  <button class="tool-btn" id="btn-draw" onclick="toggleDraw()">✏️ Draw area</button>
+  <button class="tool-btn" id="btn-undo" onclick="undoPoint()" style="display:none">↩ Undo</button>
+  <button class="tool-btn" id="btn-finish" onclick="finishPolygon()" style="display:none">✓ Finish area</button>
+  <button class="tool-btn danger" id="btn-clear-zone" onclick="clearZone()" style="display:none">🗑 Clear area</button>
+  <button class="tool-btn danger" id="btn-clear-searches" onclick="clearAllSearches()" style="display:none">✕ Clear searches</button>
+</div>
+<div id="search-bar">
+  <input id="search-input" placeholder="Search street or address in Tel Aviv…" onkeydown="if(event.key==='Enter') doSearch()" />
+  <button id="search-btn" onclick="doSearch()">🔍 Search</button>
+</div>
+<div id="extracting-banner">🤖 Extracting address from post…</div>
+<div id="map"></div>
+<div id="status">Loading…</div>
+
+<script>
+const NEAR_METERS = 400;
+const STORAGE_KEY = 'tlv_area_finder_polygon';
+let map, drawing = false, points = [], tempMarkers = [], tempLine = null, polygon = null;
+let searchMarkers = [];
+
+function loadCSS(href) {
+  const link = document.createElement('link'); link.rel = 'stylesheet'; link.href = href; document.head.appendChild(link);
+}
+function loadScript(src, cb) {
+  const s = document.createElement('script'); s.src = src; s.onload = cb;
+  s.onerror = () => alert('Failed to load map. Check internet connection.');
+  document.head.appendChild(s);
+}
+
+function init() {
+  loadCSS('https://unpkg.com/leaflet@1.9.4/dist/leaflet.css');
+  loadScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', function() {
+    map = L.map('map').setView([32.0853, 34.7818], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors', maxZoom: 19
+    }).addTo(map);
+    map.on('click', onMapClick);
+    loadSavedPolygon();
+    setStatus(polygon ? 'Area restored. Search for addresses below.' : 'Click "Draw area" to start.');
+  });
+}
+
+// Called by Android Java when a post is shared into the app
+function handleSharedText(text) {
+  const banner = document.getElementById('extracting-banner');
+  banner.style.display = 'block';
+  setStatus('Reading shared post…');
+  const apiKey = window.CLAUDE_API_KEY || '';
+  fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: `Extract only the street address or street name from this Hebrew/English text. Reply with just the address, nothing else. If no address found, reply with "NOT_FOUND".\n\nText: ${text}`
+      }]
+    })
+  })
+  .then(r => r.json())
+  .then(data => {
+    banner.style.display = 'none';
+    const address = data.content?.[0]?.text?.trim();
+    if (!address || address === 'NOT_FOUND') {
+      setStatus('No address found in shared post.');
+      return;
+    }
+    document.getElementById('search-input').value = address;
+    doSearch();
+  })
+  .catch(() => {
+    banner.style.display = 'none';
+    setStatus('Failed to extract address. Try searching manually.');
+  });
+}
+
+function savePolygon() {
+  if (!polygon) { localStorage.removeItem(STORAGE_KEY); return; }
+  const pts = polygon.getLatLngs()[0].map(p => [p.lat, p.lng]);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(pts));
+}
+
+function loadSavedPolygon() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (!saved) return;
+    const pts = JSON.parse(saved).map(([lat, lng]) => L.latLng(lat, lng));
+    if (pts.length < 3) return;
+    polygon = L.polygon(pts, { color: '#1d4ed8', fillColor: '#3b82f6', fillOpacity: 0.15, weight: 2 }).addTo(map);
+    map.fitBounds(polygon.getBounds(), { padding: [40, 40] });
+    document.getElementById('btn-clear-zone').style.display = '';
+  } catch(e) { localStorage.removeItem(STORAGE_KEY); }
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+function ptInPolygon(latlng, poly) {
+  const pts = poly.getLatLngs()[0];
+  let inside = false;
+  const x = latlng.lng, y = latlng.lat;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i].lng, yi = pts[i].lat, xj = pts[j].lng, yj = pts[j].lat;
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+
+function distToPolygonMeters(latlng, poly) {
+  const pts = poly.getLatLngs()[0];
+  let min = Infinity;
+  for (const p of pts) { const d = latlng.distanceTo(p); if (d < min) min = d; }
+  return min;
+}
+
+function getDistLabel(latlng) {
+  if (!polygon) return 'No area defined';
+  if (ptInPolygon(latlng, polygon)) return '✅ Inside your area';
+  const dist = distToPolygonMeters(latlng, polygon);
+  if (dist < 1000) return `❌ ~${Math.round(dist)}m from area`;
+  return `❌ ~${(dist / 1000).toFixed(1)}km from area`;
+}
+
+const pinSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 36" width="24" height="36"><path d="M12 0C5.4 0 0 5.4 0 12c0 9 12 24 12 24S24 21 24 12C24 5.4 18.6 0 12 0z" fill="#e05c2a"/><circle cx="12" cy="12" r="5" fill="white"/></svg>`;
+
+async function doSearch() {
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) return;
+  setStatus('Searching…');
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q + ', Tel Aviv, Israel')}&format=json&limit=5&countrycodes=il`;
+    const res = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+    const data = await res.json();
+    if (!data.length) { setStatus('No results found. Try a different address.'); return; }
+    const best = data[0];
+    const latlng = L.latLng(parseFloat(best.lat), parseFloat(best.lon));
+    const label = best.display_name.split(',').slice(0, 2).join(', ');
+    const distLabel = getDistLabel(latlng);
+    const marker = L.marker(latlng, {
+      icon: L.divIcon({ className: '', html: pinSvg, iconSize: [24, 36], iconAnchor: [12, 36] })
+    }).addTo(map).bindPopup(`<strong>${label}</strong><br><span style="font-size:12px">${distLabel}</span>`).openPopup();
+    searchMarkers.push(marker);
+    map.setView(latlng, 16);
+    document.getElementById('search-input').value = '';
+    document.getElementById('btn-clear-searches').style.display = '';
+    setStatus(`Found: ${label} — ${distLabel}`);
+  } catch(e) {
+    setStatus('Search failed — check your internet connection.');
+  }
+}
+
+function clearAllSearches() {
+  searchMarkers.forEach(m => map.removeLayer(m));
+  searchMarkers = [];
+  document.getElementById('btn-clear-searches').style.display = 'none';
+  setStatus('All search pins cleared.');
+}
+
+function onMapClick(e) {
+  if (!drawing) return;
+  points.push(e.latlng);
+  const dot = L.circleMarker(e.latlng, { radius: 5, color: '#1d4ed8', fillColor: '#3b82f6', fillOpacity: 1, weight: 2 }).addTo(map);
+  tempMarkers.push(dot);
+  if (tempLine) map.removeLayer(tempLine);
+  if (points.length > 1) tempLine = L.polyline(points, { color: '#3b82f6', weight: 2, dashArray: '6,4' }).addTo(map);
+  const n = points.length;
+  setStatus(`${n} point${n > 1 ? 's' : ''} added. ${n >= 3 ? 'Click "Finish area" or keep adding.' : 'Add at least 3 points.'}`);
+}
+
+function toggleDraw() {
+  drawing = !drawing;
+  const btn = document.getElementById('btn-draw');
+  if (drawing) {
+    btn.classList.add('active'); btn.textContent = '✕ Cancel';
+    document.getElementById('btn-undo').style.display = '';
+    document.getElementById('btn-finish').style.display = '';
+    map.getContainer().style.cursor = 'crosshair';
+    setStatus('Click on the map to place points around your desired area.');
+  } else { cancelDraw(); }
+}
+
+function cancelDraw() {
+  drawing = false; points = [];
+  tempMarkers.forEach(m => map.removeLayer(m)); tempMarkers = [];
+  if (tempLine) { map.removeLayer(tempLine); tempLine = null; }
+  const btn = document.getElementById('btn-draw');
+  btn.classList.remove('active'); btn.textContent = '✏️ Draw area';
+  document.getElementById('btn-undo').style.display = 'none';
+  document.getElementById('btn-finish').style.display = 'none';
+  map.getContainer().style.cursor = '';
+  setStatus(polygon ? 'Area defined. Search for addresses below.' : 'Click "Draw area" to start.');
+}
+
+function undoPoint() {
+  if (!points.length) return;
+  points.pop();
+  const m = tempMarkers.pop(); if (m) map.removeLayer(m);
+  if (tempLine) { map.removeLayer(tempLine); tempLine = null; }
+  if (points.length > 1) tempLine = L.polyline(points, { color: '#3b82f6', weight: 2, dashArray: '6,4' }).addTo(map);
+  setStatus(points.length ? `${points.length} point${points.length > 1 ? 's' : ''} — keep clicking.` : 'All points removed.');
+}
+
+function finishPolygon() {
+  if (points.length < 3) { setStatus('Add at least 3 points first.'); return; }
+  if (polygon) map.removeLayer(polygon);
+  polygon = L.polygon(points, { color: '#1d4ed8', fillColor: '#3b82f6', fillOpacity: 0.15, weight: 2 }).addTo(map);
+  document.getElementById('btn-clear-zone').style.display = '';
+  map.fitBounds(polygon.getBounds(), { padding: [40, 40] });
+  savePolygon();
+  cancelDraw();
+}
+
+function clearZone() {
+  if (polygon) { map.removeLayer(polygon); polygon = null; }
+  document.getElementById('btn-clear-zone').style.display = 'none';
+  savePolygon();
+  setStatus('Area cleared. Draw a new one.');
+}
+
+window.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
