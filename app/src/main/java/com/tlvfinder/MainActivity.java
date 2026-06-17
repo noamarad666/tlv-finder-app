@@ -56,61 +56,73 @@ public class MainActivity extends AppCompatActivity {
         if (!Intent.ACTION_SEND.equals(intent.getAction())) return;
         String type = intent.getType();
         if (type == null || !type.startsWith("text/")) return;
+
+        // Try both EXTRA_TEXT and EXTRA_SUBJECT
         String sharedText = intent.getStringExtra(Intent.EXTRA_TEXT);
-        if (sharedText == null || sharedText.isEmpty()) return;
+        String sharedSubject = intent.getStringExtra(Intent.EXTRA_SUBJECT);
+        String combined = "";
+        if (sharedSubject != null) combined += sharedSubject + " ";
+        if (sharedText != null) combined += sharedText;
+        combined = combined.trim();
+
+        if (combined.isEmpty()) return;
         if (pageReady) {
-            processSharedText(sharedText);
+            processSharedText(combined);
         } else {
-            pendingSharedText = sharedText;
+            pendingSharedText = combined;
         }
     }
 
     private void processSharedText(String text) {
+        // Show what we received in the status bar for debugging
+        String preview = text.length() > 60 ? text.substring(0, 60) : text;
+        String escapedPreview = preview.replace("\\", "").replace("'", "").replace("\n", " ").replace("\"", "");
+        webView.evaluateJavascript(
+            "document.getElementById('status').textContent='Received: " + escapedPreview + "';", null);
+
         String address = extractAddress(text);
         if (address != null && !address.isEmpty()) {
             String escaped = address.replace("\\", "\\\\").replace("'", "\\'");
             webView.evaluateJavascript(
                 "document.getElementById('search-input').value='" + escaped + "'; doSearch();", null);
-        } else {
-            webView.evaluateJavascript(
-                "document.getElementById('status').textContent='No address found. Try searching manually.';", null);
         }
+        // If no address found, status bar already shows what was received — user can type manually
     }
 
     private String extractAddress(String text) {
-        String[] keywords = {"\u05E8\u05D7\u05D5\u05D1", "\u05E8\u05D7'", "\u05E9\u05D3\u05E8\u05D5\u05EA", "\u05E1\u05DE\u05D8\u05EA", " on ", " at ", " in "};
+        String[] keywords = {
+            "רחוב ",
+            "רח' ",
+            "שדרות ",
+            "סמטת ",
+            " on ",
+            " at ",
+            " in "
+        };
         List<String> cityWords = Arrays.asList("תל", "אביב", "tel", "aviv", "israel", "ישראל");
 
         for (String kw : keywords) {
-            int idx = text.toLowerCase().indexOf(kw.toLowerCase());
+            int idx = text.indexOf(kw);
+            if (idx == -1) idx = text.toLowerCase().indexOf(kw.toLowerCase());
             if (idx == -1) continue;
 
             String after = text.substring(idx + kw.length()).trim();
-
-            // Split on newline, dash, or open paren
             String chunk = after.split("[\n\\(\\-]")[0].trim();
-
-            // Take up to 3 words
             String[] allWords = chunk.split("\\s+");
             int take = Math.min(3, allWords.length);
-            String[] words = Arrays.copyOf(allWords, take);
 
-            // Drop trailing city names
-            while (take > 0 && cityWords.contains(words[take - 1].toLowerCase())) {
+            while (take > 0 && cityWords.contains(allWords[take - 1].toLowerCase().replaceAll("[,.]", ""))) {
                 take--;
             }
-
             if (take == 0) continue;
 
             StringBuilder result = new StringBuilder();
             for (int i = 0; i < take; i++) {
                 if (i > 0) result.append(" ");
-                result.append(words[i]);
+                result.append(allWords[i]);
             }
-
-            // Strip trailing punctuation
-            String final_ = result.toString().replaceAll("[,\\.]+$", "").trim();
-            if (final_.length() > 1) return final_;
+            String finalResult = result.toString().replaceAll("[,\\.]+$", "").trim();
+            if (finalResult.length() > 1) return finalResult;
         }
         return null;
     }
