@@ -1,23 +1,32 @@
 package com.tlvfinder;
 
-import android.content.ClipboardManager;
-import android.content.ClipData;
-import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.WebChromeClient;
 import androidx.appcompat.app.AppCompatActivity;
 
-import java.util.Arrays;
-import java.util.List;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
     private WebView webView;
     private boolean pageReady = false;
     private String pendingText = null;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    // Your Render server URL — will be set after deploy
+    private static final String SERVER_URL = BuildConfig.SERVER_URL;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -36,77 +45,98 @@ public class MainActivity extends AppCompatActivity {
             public void onPageFinished(WebView view, String url) {
                 pageReady = true;
                 if (pendingText != null) {
-                    handleText(pendingText);
+                    processSharedText(pendingText);
                     pendingText = null;
                 }
             }
         });
 
         webView.loadUrl("file:///android_asset/index.html");
+        handleIntent(getIntent());
     }
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        String clipboard = getClipboardText();
-        if (clipboard != null && !clipboard.isEmpty() && !clipboard.startsWith("http")) {
-            if (pageReady) handleText(clipboard);
-            else pendingText = clipboard;
-        }
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntent(intent);
     }
 
-    private String getClipboardText() {
-        try {
-            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm == null || !cm.hasPrimaryClip()) return null;
-            ClipData.Item item = cm.getPrimaryClip().getItemAt(0);
-            if (item == null) return null;
-            CharSequence text = item.getText();
-            return text != null ? text.toString() : null;
-        } catch (Exception e) {
-            return null;
-        }
+    private void handleIntent(Intent intent) {
+        if (intent == null) return;
+        if (!Intent.ACTION_SEND.equals(intent.getAction())) return;
+        String type = intent.getType();
+        if (type == null || !type.startsWith("text/")) return;
+        String sharedText = intent.getStringExtra(Intent.EXTRA_TEXT);
+        if (sharedText == null || sharedText.isEmpty()) return;
+        if (pageReady) processSharedText(sharedText);
+        else pendingText = sharedText;
     }
 
-    private void handleText(String text) {
-        String address = extractAddress(text);
-        if (address != null && !address.isEmpty()) {
-            // Put ONLY the extracted address in the search box
-            String escaped = address.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", "");
-            webView.evaluateJavascript(
-                "document.getElementById('search-input').value='" + escaped + "'; doSearch();", null);
-        }
-        // If no address found, do nothing — don't put garbage in the search box
-    }
+    private void processSharedText(final String text) {
+        setStatus("Extracting address\u2026");
 
-    private String extractAddress(String text) {
-        String[] keywords = { "רחוב ", "רח' ", "שדרות ", "סמטת ", " on ", " at " };
-        List<String> cityWords = Arrays.asList("תל", "אביב", "tel", "aviv", "israel", "ישראל");
+        executor.execute(() -> {
+            try {
+                // Build JSON body
+                String jsonBody;
+                if (text.trim().startsWith("http")) {
+                    jsonBody = "{\"url\":\"" + text.trim().replace("\"", "\\\"") + "\"}";
+                } else {
+                    String safeText = text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "");
+                    jsonBody = "{\"text\":\"" + safeText + "\"}";
+                }
 
-        for (String kw : keywords) {
-            int idx = text.indexOf(kw);
-            if (idx == -1) idx = text.toLowerCase().indexOf(kw.toLowerCase());
-            if (idx == -1) continue;
+                URL url = new URL(SERVER_URL + "/extract");
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(20000);
 
-            String after = text.substring(idx + kw.length()).trim();
-            String chunk = after.split("[\n\\(\\-]")[0].trim();
-            String[] allWords = chunk.split("\\s+");
-            int take = Math.min(3, allWords.length);
+                OutputStream os = conn.getOutputStream();
+                os.write(jsonBody.getBytes("UTF-8"));
+                os.close();
 
-            while (take > 0 && cityWords.contains(allWords[take - 1].toLowerCase().replaceAll("[,.]", ""))) {
-                take--;
+                BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line);
+                br.close();
+
+                String response = sb.toString();
+
+                // Parse "address":"VALUE"
+                String address = null;
+                int idx = response.indexOf("\"address\":\"");
+                if (idx != -1) {
+                    int start = idx + 11;
+                    int end = response.indexOf("\"", start);
+                    if (end > start) address = response.substring(start, end).trim();
+                }
+
+                final String finalAddress = address;
+                mainHandler.post(() -> {
+                    if (finalAddress != null && !finalAddress.isEmpty()) {
+                        String escaped = finalAddress.replace("\\", "\\\\").replace("'", "\\'");
+                        webView.evaluateJavascript(
+                            "document.getElementById('search-input').value='" + escaped + "'; doSearch();", null);
+                    } else {
+                        setStatus("No address found. Try searching manually.");
+                    }
+                });
+
+            } catch (Exception e) {
+                mainHandler.post(() -> setStatus("Server error. Try searching manually."));
             }
-            if (take == 0) continue;
+        });
+    }
 
-            StringBuilder result = new StringBuilder();
-            for (int i = 0; i < take; i++) {
-                if (i > 0) result.append(" ");
-                result.append(allWords[i]);
-            }
-            String finalResult = result.toString().replaceAll("[,\\.]+$", "").trim();
-            if (finalResult.length() > 1) return finalResult;
-        }
-        return null;
+    private void setStatus(String msg) {
+        String escaped = msg.replace("'", "\\'");
+        webView.evaluateJavascript(
+            "document.getElementById('status').textContent='" + escaped + "';", null);
     }
 
     @Override
